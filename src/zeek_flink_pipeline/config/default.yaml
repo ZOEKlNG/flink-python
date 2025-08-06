@@ -1,0 +1,16 @@
+kafka:
+  bootstrap_servers: localhost:9092
+  source_topics:
+    - zeek_http_log
+    - zeek_tcp_log
+    - zeek_udp_log
+    - zeek_quic_log
+    - zeek_https_log
+    - zeek_session_timeout
+  sink_topic: detection_sample_files
+
+app:
+  session_buffer_size: 100
+  session_emit_size: 50
+  app_queue_size: 100
+  app_emit_size: 50
