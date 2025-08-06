@@ -1,1 +1,183 @@
-# flink-python
+# **Flink Zeek 日志处理项目设计文档**
+
+## **1\. 项目概述**
+
+本项目旨在通过 Flink 实时计算平台，处理由 Zeek 网络安全监控工具产生的、发送到多个 Kafka Topic 的网络日志数据。系统将对原始日志进行预处理、会话重组、特征提取，最终生成可用于后续安全检测的样本文件，并将其输出到新的 Kafka Topic。
+
+## **2\. 数据结构规范 (Data Schema)**
+
+为了保证数据的一致性和处理的便捷性，我们统一采用 **snake\_case** 风格的 JSON 字段命名。所有时间戳统一使用 **Unix Timestamp (毫秒)**，以方便 Flink 进行事件时间处理。
+
+### **2.1 Kafka Source Topics**
+
+#### **2.1.1 zeek\_http\_log**
+
+此 Topic 包含从 Zeek 解析出的 HTTP 事件日志。
+
+| 字段名 (Field Name) | 数据类型 (Type) | 注释 (Comment) |
+| :---- | :---- | :---- |
+| timestamp | Long | 事件发生的 Unix 时间戳 (毫秒) |
+| uid | String | Zeek 生成的唯一会话 ID |
+| source\_ip | String | 源 IP 地址 |
+| destination\_ip | String | 目的 IP 地址 |
+| host | String | HTTP 请求的目标域名 |
+| uri | String | 请求的 URI 路径 |
+| content\_length\_pair | Array\[Int\] | \[请求体长度, 响应体长度\] |
+| user\_id\_tlv | String | 包含用户身份信息的 TLV (Type-Length-Value) 编码字符串 |
+| ... | ... | 其他 Zeek 输出的 HTTP 相关字段 |
+
+**JSON 示例:**
+
+{  
+    "timestamp": 1743604039200,  
+    "uid": "CAbcdeFG12345",  
+    "source\_ip": "192.168.1.10",  
+    "destination\_ip": "202.108.22.5",  
+    "host": "example.com",  
+    "uri": "/index.html",  
+    "content\_length\_pair": \[300, 1800\],  
+    "user\_id\_tlv": "010A5A68616E6773616E"  
+}
+
+#### **2.1.2 zeek\_tcp\_log / zeek\_udp\_log**
+
+这两个 Topic 分别包含 TCP 和 UDP 的元数据。
+
+| 字段名 (Field Name) | 数据类型 (Type) | 注释 (Comment) |
+| :---- | :---- | :---- |
+| timestamp | Long | 事件发生的 Unix 时间戳 (毫秒) |
+| uid | String | Zeek 生成的唯一会话 ID |
+| source\_ip | String | 源 IP 地址 |
+| destination\_ip | String | 目的 IP 地址 |
+| payload\_bytes | Long | 传输层负载的字节数 |
+| user\_id\_tlv | String | 包含用户身份信息的 TLV 编码字符串 |
+| ... | ... | 其他 Zeek 输出的相关字段 |
+
+**JSON 示例 (zeek\_tcp\_log):**
+
+{  
+    "timestamp": 1743604040000,  
+    "uid": "CAbcdeFG12345",  
+    "source\_ip": "192.168.1.10",  
+    "destination\_ip": "202.108.22.5",  
+    "payload\_bytes": 1400,  
+    "user\_id\_tlv": "010A5A68616E6773616E"  
+}
+
+#### **2.1.3 zeek\_quic\_log / zeek\_https\_log**
+
+这两个 Topic 包含 QUIC 和 HTTPS (TLS) 的元数据。
+
+| 字段名 (Field Name) | 数据类型 (Type) | 注释 (Comment) |
+| :---- | :---- | :---- |
+| timestamp | Long | 事件发生的 Unix 时间戳 (毫秒) |
+| uid | String | Zeek 生成的唯一会话 ID |
+| source\_ip | String | 源 IP 地址 |
+| destination\_ip | String | 目的 IP 地址 |
+| sni | String | 服务器名称指示 (Server Name Indication)，通常是域名 |
+| record\_length | Long | QUIC 负载或 TLS 记录的长度 |
+| user\_id\_tlv | String | 包含用户身份信息的 TLV 编码字符串 |
+| ... | ... | 其他 Zeek 输出的相关字段 |
+
+**JSON 示例 (zeek\_https\_log):**
+
+{  
+    "timestamp": 1743604041234,  
+    "uid": "CXyz123Abc456",  
+    "source\_ip": "192.168.1.20",  
+    "destination\_ip": "180.101.49.12",  
+    "sni": "www.baidu.com",  
+    "record\_length": 140,  
+    "user\_id\_tlv": "020B4C695369"  
+}
+
+#### **2.1.4 zeek\_session\_timeout**
+
+此 Topic 用于接收会话结束或超时的通知。
+
+| 字段名 (Field Name) | 数据类型 (Type) | 注释 (Comment) |
+| :---- | :---- | :---- |
+| timestamp | Long | 会话结束的 Unix 时间戳 (毫秒) |
+| uid | String | 结束的会话的唯一 ID |
+| is\_timeout | Boolean | 固定为 true，明确表示这是一个超时/结束事件 |
+
+**JSON 示例:**
+
+{  
+    "timestamp": 1743604090000,  
+    "uid": "CAbcdeFG12345",  
+    "is\_timeout": true  
+}
+
+### **2.2 Kafka Sink Topic**
+
+#### **2.2.1 detection\_sample\_files**
+
+此 Topic 用于输出最终生成的待检测样本文件。
+
+| 字段名 (Field Name) | 数据类型 (Type) | 注释 (Comment) |
+| :---- | :---- | :---- |
+| user\_id | String | 样本所属的用户 ID |
+| user\_name | String | 用户名 (如果能从状态中获取) |
+| app\_id | String | 样本所属的应用 ID |
+| generation\_timestamp | Long | 样本文件的生成时间戳 (毫秒) |
+| packet\_sequences | Array\[String\] | 由多个报文序列拼接或编码后的字符串数组 |
+| metadata | Object | 包含其他附加信息的对象，如处理节点、数据源等 |
+
+## **3\. Flink 数据流处理模型**
+
+整个处理流程可以分为以下几个核心阶段：
+
+### **阶段一：数据源与预处理 (Source & Pre-processing)**
+
+1. **消费数据**: Flink 作业从上述所有 zeek\_\*\_log 和 zeek\_session\_timeout Topic 中消费数据。可以根据需求将多个 Topic 合并 (union) 成一个或多个逻辑流。  
+2. **数据规范化**: 将来自不同 Topic 的数据流转换 (map) 为统一的内部数据结构。例如，payload\_bytes 和 record\_length 都可以映射到一个通用的 bytes\_length 字段。  
+3. **提取用户ID**: 编写一个 UDF (User-Defined Function) 来解析 user\_id\_tlv 字符串，提取出核心的 user\_id。  
+4. **设置 Watermark**: 基于 timestamp 字段设置 Watermark，以支持事件时间处理。  
+5. **按用户分区**: 使用 keyBy(user\_id) 将数据流按照用户 ID 进行分区。后续所有操作都将在同一个用户的分区内进行，保证了用户数据的聚合性。
+
+### **阶段二：会话级处理 (Session-Level Processing)**
+
+此阶段的目标是将会话内的零散报文聚合成有序的**报文序列 (Packet Sequence)**。
+
+1. **核心算子**: 使用 KeyedProcessFunction\<String, UnifiedLog, PacketSequence\>。其中，Key 是 user\_id。  
+2. **状态管理**:  
+   * MapState\<String, List\<UnifiedLog\>\> sessionBuffer: 使用一个 MapState 来管理该用户下的所有活动会话。  
+     * **Key**: 会话 uid。  
+     * **Value**: 一个 List，用于暂存该会话收到的所有报文 (UnifiedLog 对象)。  
+3. **处理逻辑 (processElement)**:  
+   * **数据到达**: 每当一条日志 (UnifiedLog) 到达，根据其 uid 将其添加到 sessionBuffer 对应的 List 中。  
+   * **超时/结束信号**: 如果到达的是一条超时记录 (is\_timeout: true)，则找到对应的 uid，将该会话的**所有**暂存报文排序后，生成一个或多个报文序列，然后从 sessionBuffer 中移除该 uid 的条目。  
+   * 缓冲区满处理: 在添加报文后，检查 List 的大小。如果达到阈值（例如 100 条），则：  
+     a. 对 List 内的报文按 timestamp 升序排序。  
+     b. 取出前 50 条记录，生成一个报文序列。  
+     c. 将这 50 条记录从 List 中移除。  
+     d. 将生成的报文序列向下游发送。  
+4. **输出**: 此阶段的输出是一个 PacketSequence 对象，它包含 user\_id, app\_id, timestamp 以及由报文数据构成的序列。
+
+### **阶段三：应用级聚合 (Application-Level Aggregation)**
+
+此阶段的目标是将来自同一个用户的、属于同一个应用的多个报文序列聚合成最终的**样本文件 (Sample File)**。
+
+1. **核心算子**: 由于上一步已经是 keyBy(user\_id)，数据仍在同一个用户分区内。我们可以继续使用 KeyedProcessFunction\<String, PacketSequence, SampleFile\>。  
+2. **状态管理**:  
+   * MapState\<String, List\<PacketSequence\>\> appQueues: 管理该用户下，按应用分类的报文序列队列。  
+     * **Key**: 应用 app\_id。  
+     * **Value**: 一个 List，用于暂存该应用收到的所有报文序列。  
+   * ValueState\<String\> userInfo: 存储用户元信息，如 user\_name。  
+3. **处理逻辑 (processElement 和 onTimer)**:  
+   * **报文序列到达**: 每当一个 PacketSequence 到达，根据其 app\_id 将其添加到 appQueues 对应的队列中。同时，为该 app\_id 注册一个处理时间定时器（例如，当前时间 \+ 1 分钟），用于处理该应用队列的非活动超时。  
+   * 队列满处理: 添加后，检查 app\_id 对应队列的大小。如果达到阈值（例如 100 条），则：  
+     a. 对队列按时间戳排序。  
+     b. 取出前 50 个序列，生成一个样本文件。  
+     c. 将这 50 个序列从队列中移除。  
+     d. 将生成的样本文件发送到最终的 Kafka Topic。  
+   * **应用级超时与清理 (onTimer)**:  
+     * 当为某个 app\_id 注册的定时器触发时，意味着该应用的队列在指定时间内没有新的序列进入。  
+     * 将该 app\_id 队列中所有剩余的序列打包成一个最终的样本文件刷出。  
+     * 从 MapState\<String, List\<PacketSequence\>\> appQueues 中移除该 app\_id 对应的条目。  
+   * **用户级状态自动清理**: 整体的用户状态（包括 appQueues 和 userInfo）将配置 Flink 的**状态生存时间 (State TTL)**。可以设置一个比应用级超时更长的时间（例如 10 分钟）。如果一个用户在 10 分钟内没有任何活动（即没有任何状态被访问或更新），Flink 将自动清理该用户的所有相关状态，从而高效、自动地释放资源，无需手动管理用户级超时。
+
+### **阶段四：输出 (Sink)**
+
+将最终生成的 SampleFile 对象序列化为 JSON 字符串，发送到 detection\_sample\_files Kafka Topic 中，供下游系统消费。
