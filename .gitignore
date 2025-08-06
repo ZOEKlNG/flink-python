@@ -1,0 +1,25 @@
+data/
+
+
+# 忽略 Python 编译生成的缓存文件
+__pycache__/
+*.py[cod]
+
+# 忽略 VSCode/IDEA 等编辑器产生的文件
+.vscode/
+.idea/
+*.log
+*.bak
+.DS_Store
+logs/
+saved_pcaps/
+venv/
+.venv/
+todo
+*.png
+temp.json
+dicts/
+*.7z
+example/
+
+
