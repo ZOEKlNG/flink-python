@@ -4,14 +4,19 @@ import dataclasses
 import json
 from typing import Iterable
 
-from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.datastream import StreamExecutionEnvironment, OutputTag
 from pyflink.datastream.connectors import FlinkKafkaConsumer, FlinkKafkaProducer
+from pyflink.datastream.functions import ProcessFunction
 from pyflink.common.serialization import SimpleStringSchema
 
-from flink_zeek.models import UnifiedLog
+from flink_zeek.models import UnifiedLog, PacketSequence
 from flink_zeek.tlv import parse_user_id_tlv
 from flink_zeek.session_processor import SessionProcessor
 from flink_zeek.app_processor import ApplicationProcessor
+
+
+WEIXIN_TAG = OutputTag("weixin")
+QQ_TAG = OutputTag("qq")
 
 
 def deserialize_log(raw: str) -> UnifiedLog:
@@ -27,6 +32,8 @@ def deserialize_log(raw: str) -> UnifiedLog:
         bytes_length = data.get("record_length", 0)
         app_id = data.get("sni", "")
 
+    protocol = data.get("protocol") or data.get("proto") or data.get("log_type", "")
+
     return UnifiedLog(
         timestamp=data.get("timestamp", 0),
         uid=data.get("uid", ""),
@@ -35,8 +42,19 @@ def deserialize_log(raw: str) -> UnifiedLog:
         bytes_length=bytes_length,
         user_id=user_id,
         app_id=app_id,
+        protocol=protocol,
         raw=data,
     )
+
+
+class AppSplitter(ProcessFunction):
+    """Route logs to side outputs based on ``app_id``."""
+
+    def process_element(self, value: UnifiedLog, ctx: ProcessFunction.Context, out):
+        if value.app_id == "weixin":
+            ctx.output(WEIXIN_TAG, value)
+        elif value.app_id == "qq":
+            ctx.output(QQ_TAG, value)
 
 
 def main() -> None:
@@ -57,11 +75,39 @@ def main() -> None:
     consumer = FlinkKafkaConsumer(topics, SimpleStringSchema(), kafka_props)
     stream = env.add_source(consumer).map(deserialize_log)
 
-    session_proc = SessionProcessor()
-    sequences = stream.key_by(lambda log: log.user_id).flat_map(lambda log: session_proc.process(log))
+    # Split stream by application id using side outputs
+    split_stream = stream.process(AppSplitter())
+    weixin_stream = split_stream.get_side_output(WEIXIN_TAG)
+    qq_stream = split_stream.get_side_output(QQ_TAG)
 
-    app_proc = ApplicationProcessor()
-    samples = sequences.key_by(lambda seq: seq.user_id).flat_map(lambda seq: app_proc.process(seq))
+    def build_app_pipeline(app_stream):
+        session_proc = SessionProcessor()
+        app_proc = ApplicationProcessor()
+
+        def handle_log(log: UnifiedLog) -> Iterable[PacketSequence]:
+            if log.protocol in {"tcp", "udp", "https", "quic"}:
+                return session_proc.process(log)
+            if log.protocol == "http":
+                # Example placeholder for domain embedding
+                log.raw["embedded_domain"] = log.raw.get("host", "")
+                return [
+                    PacketSequence(
+                        user_id=log.user_id,
+                        app_id=log.app_id,
+                        protocol=log.protocol,
+                        timestamp=log.timestamp,
+                        packets=[log],
+                    )
+                ]
+            return []
+
+        sequences = app_stream.key_by(lambda l: l.user_id).flat_map(handle_log)
+        return sequences.key_by(lambda s: s.user_id).flat_map(lambda s: app_proc.process(s))
+
+    weixin_samples = build_app_pipeline(weixin_stream)
+    qq_samples = build_app_pipeline(qq_stream)
+
+    all_samples = weixin_samples.union(qq_samples)
 
     producer = FlinkKafkaProducer(
         topic="detection_sample_files",
@@ -69,7 +115,7 @@ def main() -> None:
         producer_config=kafka_props,
     )
 
-    samples.map(lambda s: json.dumps(dataclasses.asdict(s))).add_sink(producer)
+    all_samples.map(lambda s: json.dumps(dataclasses.asdict(s))).add_sink(producer)
 
     env.execute("flink-zeek-pipeline")
 
