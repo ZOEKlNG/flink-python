@@ -15,6 +15,7 @@ class UnifiedLog:
     bytes_length: int
     user_id: str
     app_id: str
+    protocol: str
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -24,6 +25,7 @@ class PacketSequence:
 
     user_id: str
     app_id: str
+    protocol: str
     timestamp: int
     packets: List[UnifiedLog]
 

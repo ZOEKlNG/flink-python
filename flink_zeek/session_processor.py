@@ -43,6 +43,7 @@ class SessionProcessor:
                 PacketSequence(
                     user_id=batch[0].user_id,
                     app_id=batch[0].app_id,
+                    protocol=batch[0].protocol,
                     timestamp=batch[0].timestamp,
                     packets=batch,
                 )
@@ -58,6 +59,7 @@ class SessionProcessor:
             PacketSequence(
                 user_id=buffer[0].user_id,
                 app_id=buffer[0].app_id,
+                protocol=buffer[0].protocol,
                 timestamp=buffer[0].timestamp,
                 packets=buffer,
             )
